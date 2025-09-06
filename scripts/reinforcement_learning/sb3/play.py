@@ -44,6 +44,12 @@ parser.add_argument(
     default=False,
     help="Use a slower SB3 wrapper but keep all the extra training info.",
 )
+
+# Moji argument
+parser.add_argument("--log-tilt", type=int, default=0, help="Number of timesteps to log robot tilt (0 = disable).")
+parser.add_argument("--log_io", type=int, default=0, help="Number of io samples to log (0 = disable).")
+
+
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -66,6 +72,7 @@ import os
 import random
 import time
 import torch
+import numpy as np
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecNormalize
@@ -85,6 +92,8 @@ from isaaclab_rl.sb3 import Sb3VecEnvWrapper, process_sb3_cfg
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 from isaaclab_tasks.utils.parse_cfg import get_checkpoint_path
+
+from isaaclab.utils.math import quat_apply
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 
@@ -179,6 +188,42 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset environment
     obs = env.reset()
     timestep = 0
+    run_id = 0
+
+    time_log = []
+    tilt_log = []
+
+    input_log = []
+    output_log = []
+
+    logged_samples = 0
+    done_sampling = False
+
+    robot = env.unwrapped.scene["robot"]
+
+    # folder relative to the script file
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    tilt_log_folder = os.path.join(base_dir, "../../../tilt_logging")
+    os.makedirs(tilt_log_folder, exist_ok=True)
+
+    io_log_folder = os.path.join(base_dir, "../../../io_logging")
+    os.makedirs(io_log_folder, exist_ok=True)
+
+
+    def compute_tilt():
+        root_quat = robot.data.root_quat_w  # [N, 4]
+        batch_size = root_quat.shape[0]
+
+        world_up = torch.tensor([0, 0, 1], device=root_quat.device, dtype=root_quat.dtype).repeat(batch_size, 1)
+        up_vector = quat_apply(root_quat, world_up)
+
+        # Use atan2 to get signed tilt around XZ plane (for example roll vs. yaw)
+        # sign from projection on x-axis
+        tilt_signed = torch.atan2(up_vector[:, 0], up_vector[:, 2])  # roll tilt
+        # Or use y if you want pitch tilt: atan2(up_vector[:, 1], up_vector[:, 2])
+
+        return tilt_signed
+
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -188,16 +233,57 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             actions, _ = agent.predict(obs, deterministic=True)
             # env stepping
             obs, _, _, _ = env.step(actions)
-        if args_cli.video:
-            timestep += 1
-            # Exit the play loop after recording one video
-            if timestep == args_cli.video_length:
+
+        # log tilt if within run count
+        if run_id < args_cli.log_tilt:
+            tilt_deg = compute_tilt()[0].item() * 180.0 / 3.14159
+            sim_time = timestep * dt
+            time_log.append(sim_time)
+            tilt_log.append(tilt_deg)
+
+        if args_cli.log_io > 0 and logged_samples < args_cli.log_io and not done_sampling:
+            input_log.append(obs[0])
+            output_log.append(actions[0])
+            logged_samples += 1
+            print(f"\rSample {logged_samples}", end="", flush=True)
+
+            # print("Obs[0]: ", obs[0])
+            # print("actions[0]: ", actions[0])
+
+
+        # check loop reset (600 steps = 1 loop)
+        # if timestep >= (env.unwrapped.episode_length_s * (1 / dt)) / env.unwrapped.decimation:
+        if timestep >= env.unwrapped.max_episode_length:
+            run_id += 1
+            if run_id <= args_cli.log_tilt:
+                tilt_log_filename = os.path.join(tilt_log_folder, f"tilt_log_run{run_id}.npz")
+                np.savez(tilt_log_filename, time=np.array(time_log), tilt=np.array(tilt_log))
+                print(f"Saved tilt log to {tilt_log_filename}")
+                # reset logs for next loop
+            time_log, tilt_log = [], []
+            timestep = 0
+
+            # stop logging if finished required runs
+            if run_id >= args_cli.log_tilt and args_cli.log_tilt > 0:
+                print("Finished requested tilt logging runs.")
                 break
+
+            if logged_samples == args_cli.log_io and not done_sampling:
+                print("Finished io sampling.")
+                io_log_inputs = os.path.join(io_log_folder, "nn_inputs.npy")
+                io_log_outputs = os.path.join(io_log_folder, "nn_outputs.npy")
+                print("Inputs: ", input_log[:5])
+                print("Outputs: ", output_log[:5])
+                np.save(io_log_inputs, input_log)
+                np.save(io_log_outputs, output_log)
+                done_sampling = True
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+        timestep += 1
 
     # close the simulator
     env.close()
